@@ -2303,55 +2303,77 @@ async function processBatchedAudioChunks(chunks, voiceName, rate, pitch, volume,
 
 async function getVoice(text, voiceName = "zh-CN-XiaoxiaoNeural", rate = '+0%', pitch = '+0Hz', volume = '+0%', style = "general", outputFormat = "audio-24khz-48kbitrate-mono-mp3") {
     try {
-        // 文本预处理
         const cleanText = text.trim();
         if (!cleanText) {
             throw new Error("文本内容为空");
         }
-        
-        // 如果文本很短，直接处理
+
+        const audioHeaders = {
+            "Content-Type": "audio/mpeg",
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            ...makeCORSHeaders()
+        };
+
+        // 短文本直接转发上游 response.body，避免 response.blob() 完整缓冲。
         if (cleanText.length <= 1500) {
-            const audioBlob = await getAudioChunk(cleanText, voiceName, rate, pitch, volume, style, outputFormat);
-            return new Response(audioBlob, {
-                headers: {
-                    "Content-Type": "audio/mpeg",
-                    ...makeCORSHeaders()
-                }
-            });
+            const upstreamResponse = await getAudioChunk(
+                cleanText, voiceName, rate, pitch, volume, style, outputFormat
+            );
+            if (!upstreamResponse.body) {
+                throw new Error("上游音频响应没有可读取的响应体");
+            }
+            return new Response(upstreamResponse.body, { headers: audioHeaders });
         }
 
-        // 优化的文本分块
         const chunks = optimizedTextSplit(cleanText, 1500);
-        
-        // 检查分块数量，防止超过CloudFlare限制
         if (chunks.length > 40) {
             throw new Error(`文本过长，分块数量(${chunks.length})超过限制。请缩短文本或分批处理。`);
         }
-        
-        console.log(`文本已分为 ${chunks.length} 个块进行处理`);
 
-        // 批量处理音频块，控制并发数量和频率
-        const audioChunks = await processBatchedAudioChunks(
-            chunks, 
-            voiceName, 
-            rate, 
-            pitch, 
-            volume, 
-            style, 
-            outputFormat,
-            3,  // 每批处理3个
-            800 // 批次间延迟800ms
-        );
+        console.log(`文本已分为 ${chunks.length} 个块进行流式处理`);
 
-        // 将音频片段拼接起来
-        const concatenatedAudio = new Blob(audioChunks, { type: 'audio/mpeg' });
-        return new Response(concatenatedAudio, {
-            headers: {
-                "Content-Type": "audio/mpeg",
-                ...makeCORSHeaders()
+        // 长文本按顺序读取每个上游响应，并立即写入下游流。
+        const audioStream = new ReadableStream({
+            async start(controller) {
+                try {
+                    for (let i = 0; i < chunks.length; i++) {
+                        const upstreamResponse = await getAudioChunk(
+                            chunks[i],
+                            voiceName,
+                            rate,
+                            pitch,
+                            volume,
+                            style,
+                            outputFormat
+                        );
+
+                        if (!upstreamResponse.body) {
+                            throw new Error(`上游音频块 ${i + 1} 没有可读取的响应体`);
+                        }
+
+                        const reader = upstreamResponse.body.getReader();
+                        try {
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+                                if (value && value.length > 0) {
+                                    controller.enqueue(value);
+                                }
+                            }
+                        } finally {
+                            reader.releaseLock();
+                        }
+                    }
+                    controller.close();
+                } catch (error) {
+                    console.error("流式语音合成失败:", error);
+                    controller.error(error);
+                }
             }
         });
 
+        return new Response(audioStream, { headers: audioHeaders });
     } catch (error) {
         console.error("语音合成失败:", error);
         return new Response(JSON.stringify({
@@ -2370,8 +2392,6 @@ async function getVoice(text, voiceName = "zh-CN-XiaoxiaoNeural", rate = '+0%', 
         });
     }
 }
-
-
 
 //获取单个音频数据（增强错误处理和重试机制）
 async function getAudioChunk(text, voiceName, rate, pitch, volume, style, outputFormat = 'audio-24khz-48kbitrate-mono-mp3', maxRetries = 3) {
@@ -2436,7 +2456,8 @@ async function getAudioChunk(text, voiceName, rate, pitch, volume, style, output
                 }
             }
 
-            return await response.blob();
+            // 返回原始 Response，调用方直接消费 response.body，避免完整缓冲为 Blob.
+            return response;
             
         } catch (error) {
             if (attempt === maxRetries) {
